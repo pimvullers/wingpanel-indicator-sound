@@ -16,6 +16,7 @@
 */
 
 public class Sound.Indicator : Wingpanel.Indicator {
+    public bool is_in_session { get; construct; }
     public bool natural_scroll_touchpad { get; set; }
     public bool natural_scroll_mouse { get; set; }
     public int volume_step { get; set; }
@@ -31,6 +32,10 @@ public class Sound.Indicator : Wingpanel.Indicator {
     private Notify.Notification? notification;
     private Services.VolumeControlPulse volume_control;
 
+    private ShellKeyGrabber? key_grabber = null;
+    private ulong key_grabber_id = 0;
+    private Gee.HashMultiMap<string, uint> saved_action_ids = new Gee.HashMultiMap<string, uint> ();
+
     private bool open = false;
     private bool mute_blocks_sound = false;
     private uint sound_was_blocked_timeout_id;
@@ -45,8 +50,11 @@ public class Sound.Indicator : Wingpanel.Indicator {
 
     public static GLib.Settings settings;
 
-    public Indicator () {
-        Object (code_name: Wingpanel.Indicator.SOUND);
+    public Indicator (bool is_in_session) {
+        Object (
+            code_name: Wingpanel.Indicator.SOUND,
+            is_in_session: is_in_session
+        );
     }
 
     static construct {
@@ -125,6 +133,117 @@ public class Sound.Indicator : Wingpanel.Indicator {
                                  Canberra.PROP_APPLICATION_LANGUAGE, locale,
                                  null);
         ca_context.open ();
+
+        Bus.watch_name (BusType.SESSION, "org.gnome.Shell", BusNameWatcherFlags.NONE, on_watch, on_unwatch);
+
+        settings.changed.connect ((key) => {
+            if (key != "volume-up" &&
+                key != "volume-down" &&
+                key != "volume-mute") {
+                return;
+            }
+
+            if (key_grabber != null) {
+                ungrab_keybindings ();
+                setup_grabs ();
+            }
+        });
+    }
+
+    private void on_watch (GLib.DBusConnection connection) {
+        connection.get_proxy.begin<ShellKeyGrabber> (
+            "org.gnome.Shell", "/org/gnome/Shell", NONE, null,
+            (obj, res) => {
+                try {
+                    key_grabber = ((GLib.DBusConnection) obj).get_proxy.end<ShellKeyGrabber> (res);
+                    setup_grabs ();
+                } catch (Error e) {
+                    critical (e.message);
+                    key_grabber = null;
+                }
+            }
+        );
+    }
+
+    private void on_unwatch (GLib.DBusConnection connection) {
+        if (key_grabber_id != 0) {
+            key_grabber.disconnect (key_grabber_id);
+            key_grabber_id = 0;
+        }
+        key_grabber = null;
+        critical ("Lost connection to org.gnome.Shell");
+    }
+
+    private void ungrab_keybindings () requires (key_grabber != null) {
+        var actions = saved_action_ids.get_values ().to_array ();
+
+        try {
+            key_grabber.ungrab_accelerators (actions);
+        } catch (Error e) {
+            critical ("Couldn't ungrab accelerators: %s", e.message);
+        }
+    }
+
+    private void setup_grabs () requires (key_grabber != null) {
+        Accelerator[] accelerators = {};
+
+        var volume_up_keybindings = settings.get_strv ("volume-up");
+        for (int i = 0; i < volume_up_keybindings.length; i++) {
+            accelerators += Accelerator () {
+                name = volume_up_keybindings[i],
+                mode_flags = ActionMode.NONE,
+                grab_flags = Meta.KeyBindingFlags.NONE
+            };
+        }
+
+        var volume_down_keybindings = settings.get_strv ("volume-down");
+        for (int i = 0; i < volume_down_keybindings.length; i++) {
+            accelerators += Accelerator () {
+                name = volume_down_keybindings[i],
+                mode_flags = ActionMode.NONE,
+                grab_flags = Meta.KeyBindingFlags.NONE
+            };
+        }
+
+        var volume_mute_keybindings = settings.get_strv ("volume-mute");
+        for (int i = 0; i < volume_mute_keybindings.length; i++) {
+            accelerators += Accelerator () {
+                name = volume_mute_keybindings[i],
+                mode_flags = ActionMode.NONE,
+                grab_flags = Meta.KeyBindingFlags.IGNORE_AUTOREPEAT
+            };
+        }
+
+        uint[] action_ids;
+        try {
+            action_ids = key_grabber.grab_accelerators (accelerators);
+        } catch (Error e) {
+            critical (e.message);
+            return;
+        }
+
+        for (int i = 0; i < action_ids.length; i++) {
+            if (i < volume_up_keybindings.length) {
+                saved_action_ids.@set ("volume-up", action_ids[i]);
+            } else if (i < volume_up_keybindings.length + volume_down_keybindings.length) {
+                saved_action_ids.@set ("volume-down", action_ids[i]);
+            } else {
+                saved_action_ids.@set ("volume-mute", action_ids[i]);
+            }
+        }
+
+        key_grabber_id = key_grabber.accelerator_activated.connect (on_accelerator_activated);
+    }
+
+    private void on_accelerator_activated (uint action, GLib.HashTable<string, GLib.Variant> parameters_dict) {
+        if (action in saved_action_ids["volume-up"]) {
+            handle_change (1.0, false);
+        } else if (action in saved_action_ids["volume-down"]) {
+            handle_change (-1.0, false);
+        } else if (action in saved_action_ids["volume-mute"]) {
+            volume_control.toggle_mute ();
+            notify_change (false);
+        }
     }
 
     ~Indicator () {
@@ -303,15 +422,19 @@ public class Sound.Indicator : Wingpanel.Indicator {
             };
 
             main_box = new Gtk.Box (Gtk.Orientation.VERTICAL, 0);
-            main_box.add (mpris);
-            main_box.add (new Gtk.Separator (Gtk.Orientation.HORIZONTAL));
+            if (is_in_session) {
+                main_box.add (mpris);
+                main_box.add (new Gtk.Separator (Gtk.Orientation.HORIZONTAL));
+            }
             main_box.add (volume_scale);
             main_box.add (output_device_manager);
-            main_box.add (new Gtk.Separator (Gtk.Orientation.HORIZONTAL));
-            main_box.add (mic_scale);
-            main_box.add (input_device_manager);
-            main_box.add (mic_separator);
-            main_box.add (settings_button);
+            if (is_in_session) {
+                main_box.add (new Gtk.Separator (Gtk.Orientation.HORIZONTAL));
+                main_box.add (mic_scale);
+                main_box.add (input_device_manager);
+                main_box.add (mic_separator);
+                main_box.add (settings_button);
+            }
 
             mic_scale.notify["active"].connect (on_mic_switch_change);
 
@@ -587,10 +710,6 @@ public class Sound.Indicator : Wingpanel.Indicator {
 public Wingpanel.Indicator? get_indicator (Module module, Wingpanel.IndicatorManager.ServerType server_type) {
     debug ("Activating Sound Indicator");
 
-    if (server_type != Wingpanel.IndicatorManager.ServerType.SESSION) {
-        return null;
-    }
-
-    var indicator = new Sound.Indicator ();
+    var indicator = new Sound.Indicator (server_type == SESSION);
     return indicator;
 }
